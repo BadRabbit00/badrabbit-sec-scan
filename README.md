@@ -18,7 +18,7 @@ a file to copy, not a workflow of this repo.
 
 ## What runs
 
-**`sec-scan`** — every push, PR and weekly:
+**`sec-scan`** — every push to `develop` (merges included), every PR into `develop` or `main`, and weekly:
 
 | check   | tools | fails the build on (`--fail-on high`) |
 |---------|-------|---------------------------------------|

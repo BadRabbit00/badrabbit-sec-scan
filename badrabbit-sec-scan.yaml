@@ -14,7 +14,7 @@
 #   .sec/reports/                        output (add to .gitignore)
 #
 # Jobs:
-#   sec-scan   every push / PR / weekly: secrets (gitleaks, full history), SAST
+#   sec-scan   push to develop, PR to develop/main, weekly: secrets (gitleaks, full history), SAST
 #              (semgrep, bandit), dependencies (trivy, osv-scanner), IaC
 #              (trivy), SBOM (syft). Fails on HIGH/CRITICAL. Findings -> Security
 #              tab (SARIF), reports -> job summary and artifacts.
@@ -31,10 +31,17 @@
 name: badrabbit-sec-scan
 
 on:
+  # develop: every push, a merged PR included (a merge is a push to develop)
   push:
+    branches: [develop]
+  # PRs into develop and into main
   pull_request:
+    branches: [develop, main]
+  # merge queue, if enabled on the repository
+  merge_group:
+  # weekly on the default branch: new CVEs appear without new commits
   schedule:
-    - cron: "17 3 * * 1" # weekly: new CVEs appear without new commits
+    - cron: "17 3 * * 1"
   workflow_dispatch:
 
 permissions:
