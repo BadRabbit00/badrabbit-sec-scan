@@ -1,0 +1,190 @@
+# badrabbit-sec-scan — security checks for any repository, no Nix in the project.
+#
+# Install: copy this file to .github/workflows/badrabbit-sec-scan.yaml in the
+# project. The runner installs Nix, fetches the pinned toolset from
+# github:BadRabbit00/badrabbit-sec-scan and runs it.
+#
+# Everything project-specific lives in .sec/ (all optional):
+#   .sec/promptfoo/promptfooconfig.yaml  LLM checks: with `redteam:` a red team
+#                                        (generate -> run -> gate), otherwise
+#                                        a plain `promptfoo eval` of your cases
+#   .sec/test/                           your pytest security tests
+#   .sec/semgrep/*.yaml                  extra semgrep rules
+#   .sec/gitleaks.toml, .sec/.gitleaksignore, .sec/.trivyignore
+#   .sec/reports/                        output (add to .gitignore)
+#
+# Jobs:
+#   sec-scan   every push / PR / weekly: secrets (gitleaks, full history), SAST
+#              (semgrep, bandit), dependencies (trivy, osv-scanner), IaC
+#              (trivy), SBOM (syft). Fails on HIGH/CRITICAL. Findings -> Security
+#              tab (SARIF), reports -> job summary and artifacts.
+#   tests      pytest .sec/test, if present
+#   promptfoo  .sec/promptfoo/promptfooconfig.yaml, if present
+#
+# Settings -> Secrets and variables -> Actions:
+#   vars    SEC_SCAN_FAIL_ON        critical | high | medium | none  (default high)
+#   vars    SEC_SCAN_SKIP           e.g. "sbom,iac"
+#   vars    REDTEAM_MAX_FAILURES    failed promptfoo tests tolerated (default 0)
+#   vars    REDTEAM_TARGET_URL, SEC_TEST_TARGET_URL   staging endpoints
+#   secrets OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, REDTEAM_API_KEY,
+#           SEC_TEST_TOKEN — only what your configs and tests use
+name: badrabbit-sec-scan
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1" # weekly: new CVEs appear without new commits
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: badrabbit-sec-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin a tag or commit for reproducible runs: github:BadRabbit00/badrabbit-sec-scan/<rev>
+  SEC_SCAN_FLAKE: github:BadRabbit00/badrabbit-sec-scan
+  PROMPTFOO_CONFIG: .sec/promptfoo/promptfooconfig.yaml
+
+jobs:
+  sec-scan:
+    name: secrets, SAST, dependencies, IaC
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # gitleaks scans the whole history
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: sec-scan
+        env:
+          FAIL_ON: ${{ vars.SEC_SCAN_FAIL_ON || 'high' }}
+          SKIP: ${{ vars.SEC_SCAN_SKIP }}
+        run: |
+          args=(--out .sec/reports --fail-on "$FAIL_ON")
+          [ -n "$SKIP" ] && args+=(--skip "$SKIP")
+          nix run "$SEC_SCAN_FLAKE#sec-scan" -- "${args[@]}" .
+
+      # Security tab; needs GitHub Advanced Security on private repositories,
+      # otherwise this step is skipped with a warning.
+      - name: Upload SARIF
+        if: always() && hashFiles('.sec/reports/sarif/*.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: .sec/reports/sarif
+          category: badrabbit-sec-scan
+
+      - name: Reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sec-scan
+          path: .sec/reports
+          retention-days: 30
+
+  tests:
+    name: own security tests (.sec/test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SEC_TEST_TARGET_URL: ${{ vars.SEC_TEST_TARGET_URL }}
+      SEC_TEST_TOKEN: ${{ secrets.SEC_TEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tests present?
+        id: has
+        run: |
+          if [ -d .sec/test ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No .sec/test in the repository, own security tests skipped." >> "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: cachix/install-nix-action@v31
+        if: steps.has.outputs.run == 'true'
+
+      - name: pytest
+        if: steps.has.outputs.run == 'true'
+        run: |
+          mkdir -p .sec/reports
+          nix run "$SEC_SCAN_FLAKE#sec-pytest" -- .sec/test -ra \
+            --junitxml=.sec/reports/sec-tests.xml
+
+      - name: Reports
+        if: always() && steps.has.outputs.run == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: sec-tests
+          path: .sec/reports
+          retention-days: 30
+
+  promptfoo:
+    name: LLM checks (promptfoo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      REDTEAM_API_KEY: ${{ secrets.REDTEAM_API_KEY }}
+      REDTEAM_TARGET_URL: ${{ vars.REDTEAM_TARGET_URL }}
+      REDTEAM_MAX_FAILURES: ${{ vars.REDTEAM_MAX_FAILURES || '0' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Config present?
+        id: cfg
+        run: |
+          if [ ! -f "$PROMPTFOO_CONFIG" ]; then
+            echo "No $PROMPTFOO_CONFIG in the repository, LLM checks skipped." >> "$GITHUB_STEP_SUMMARY"
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+          elif grep -q '^redteam:' "$PROMPTFOO_CONFIG"; then
+            echo "mode=redteam" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=eval" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: cachix/install-nix-action@v31
+        if: steps.cfg.outputs.mode != 'skip'
+
+      # Red team: attacks are generated for the `purpose` in the config.
+      - name: Generate attacks
+        if: steps.cfg.outputs.mode == 'redteam'
+        run: |
+          mkdir -p .sec/reports
+          nix run "$SEC_SCAN_FLAKE#promptfoo" -- redteam generate \
+            -c "$PROMPTFOO_CONFIG" -o .sec/reports/redteam.yaml --no-cache
+
+      # eval exits 100 when tests fail; the gate below decides.
+      - name: Run
+        if: steps.cfg.outputs.mode != 'skip'
+        run: |
+          mkdir -p .sec/reports
+          cfg="$PROMPTFOO_CONFIG"
+          [ "${{ steps.cfg.outputs.mode }}" = redteam ] && cfg=.sec/reports/redteam.yaml
+          nix run "$SEC_SCAN_FLAKE#promptfoo" -- eval \
+            -c "$cfg" -o .sec/reports/promptfoo.json --no-progress-bar --no-cache \
+            || [ $? -eq 100 ]
+
+      - name: Gate
+        if: steps.cfg.outputs.mode != 'skip'
+        run: nix run "$SEC_SCAN_FLAKE#sec-scan" -- --redteam-gate .sec/reports/promptfoo.json
+
+      - name: Reports
+        if: always() && steps.cfg.outputs.mode != 'skip'
+        uses: actions/upload-artifact@v7
+        with:
+          name: promptfoo
+          path: .sec/reports
+          retention-days: 30
